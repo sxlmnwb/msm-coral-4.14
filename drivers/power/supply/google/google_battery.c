@@ -60,7 +60,7 @@
 
 
 /* AACR default slope is disabled by default */
-#define AACR_START_CYCLE_DEFAULT	100
+#define AACR_START_CYCLE_DEFAULT	400
 #define AACR_MAX_CYCLE_DEFAULT		0 /* disabled */
 
 /* qual time is 0 minutes of charge or 0% increase in SOC */
@@ -178,6 +178,8 @@ struct batt_ssoc_state {
 	int bd_trickle_recharge_soc;
 	int bd_trickle_cnt;
 	bool bd_trickle_dry_run;
+	bool bd_trickle_full;
+	bool bd_trickle_eoc;
 	u32 bd_trickle_reset_sec;
 
 	/* buff */
@@ -251,6 +253,8 @@ enum batt_aacr_state {
 	BATT_AACR_UNDER_CYCLES = -1,
 	BATT_AACR_DISABLED = 0,
 	BATT_AACR_ENABLED = 1,
+	BATT_AACR_ALGO_DEFAULT = BATT_AACR_ENABLED,
+	BATT_AACR_ALGO_LOW_B, /* lower bound */
 	BATT_AACR_MAX,
 };
 
@@ -374,6 +378,7 @@ struct batt_drv {
 	enum batt_aacr_state aacr_state;
 	int aacr_cycle_grace;
 	int aacr_cycle_max;
+	u32 aacr_algo;
 };
 
 static int batt_chg_tier_stats_cstr(char *buff, int size,
@@ -854,15 +859,6 @@ static bool batt_rl_enter(struct batt_ssoc_state *ssoc_state,
 	if (rl_current == rl_status || rl_current == BATT_RL_STATUS_DISCHARGE)
 		return false;
 
-	/* bd_trickle_cnt -1 if the rl_status change does not happen at 100% */
-	if (rl_current == BATT_RL_STATUS_RECHARGE &&
-	    rl_status == BATT_RL_STATUS_DISCHARGE) {
-		if (ssoc_get_real(ssoc_state) != SSOC_FULL) {
-			if (ssoc_state->bd_trickle_cnt > 0)
-				ssoc_state->bd_trickle_cnt--;
-		}
-	}
-
 	/* NOTE: rl_status transition from *->DISCHARGE on charger FULL (during
 	 * charge or at the end of recharge) and transition from
 	 * NONE->RECHARGE when battery is full (SOC==100%) before charger is.
@@ -1047,7 +1043,11 @@ static void batt_rl_update_status(struct batt_drv *batt_drv)
 	if (batt_drv->psy)
 		power_supply_changed(batt_drv->psy);
 
-	ssoc_state->bd_trickle_cnt++;
+	if (ssoc_state->bd_trickle_full && ssoc_state->bd_trickle_eoc) {
+		ssoc_state->bd_trickle_cnt++;
+		ssoc_state->bd_trickle_full = false;
+		ssoc_state->bd_trickle_eoc = false;
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2035,6 +2035,8 @@ static inline void batt_reset_chg_drv_state(struct batt_drv *batt_drv)
 	batt_drv->ttf_debounce = 1;
 	batt_drv->fg_status = POWER_SUPPLY_STATUS_UNKNOWN;
 	batt_drv->chg_done = false;
+	batt_drv->ssoc_state.bd_trickle_full = false;
+	batt_drv->ssoc_state.bd_trickle_eoc = false;
 	/* algo */
 	batt_drv->temp_idx = -1;
 	batt_drv->vbatt_idx = -1;
@@ -2634,14 +2636,23 @@ static int aacr_get_capacity_at_cycle(const struct batt_drv *batt_drv,
 	if (full_cap_nom < 0)
 		return full_cap_nom;
 
-	full_capacity = min(min(full_cap_nom / 1000, design_capacity),
-			    reference_capacity);
+	full_cap_nom /= 1000;
+
+	if (batt_drv->aacr_algo == BATT_AACR_ALGO_LOW_B)
+		full_capacity = min(min(full_cap_nom / 1000, design_capacity),
+				    reference_capacity);
+	else
+		full_capacity = max(min(full_cap_nom, design_capacity),
+				    reference_capacity);
+
 	aacr_capacity = max(full_capacity, min_capacity);
 	aacr_capacity = (aacr_capacity / 50) * 50; /* 50mAh, ~1% capacity */
 
 	pr_debug("%s: design=%d reference=%d full_cap_nom=%d, full=%d aacr=%d\n",
 		 __func__, design_capacity, reference_capacity, full_cap_nom,
 		 full_capacity, aacr_capacity);
+
+	pr_debug("%s: algo=%d\n", __func__, batt_drv->aacr_algo);
 
 	return aacr_capacity;
 }
@@ -2936,6 +2947,8 @@ static void bd_trickle_reset(struct batt_ssoc_state *ssoc_state,
 {
 	ssoc_state->bd_trickle_cnt = 0;
 	ssoc_state->disconnect_time = 0;
+	ssoc_state->bd_trickle_full = false;
+	ssoc_state->bd_trickle_eoc = false;
 
 	/* Set to false in cev_stats_init */
 	ce_data->bd_clear_trickle = true;
@@ -3061,9 +3074,11 @@ static int batt_chg_logic(struct batt_drv *batt_drv)
 		changed = batt_rl_enter(&batt_drv->ssoc_state,
 					BATT_RL_STATUS_DISCHARGE);
 		batt_drv->chg_done = true;
+		batt_drv->ssoc_state.bd_trickle_eoc = true;
 	} else if (batt_drv->batt_full) {
 		changed = batt_rl_enter(&batt_drv->ssoc_state,
 					BATT_RL_STATUS_RECHARGE);
+		batt_drv->ssoc_state.bd_trickle_full = true;
 
 		/* We can skip the uevent because we have volt tiers >= 100 */
 		if (changed)
@@ -3244,6 +3259,11 @@ static int batt_init_chg_profile(struct batt_drv *batt_drv)
 	ret = of_property_read_bool(node, "google,aacr-disable");
 	if (!ret && profile->aacr_nb_limits)
 		batt_drv->aacr_state = BATT_AACR_ENABLED;
+
+	ret = of_property_read_u32(node, "google,aacr-algo",
+				   &batt_drv->aacr_algo);
+	if (ret < 0)
+		batt_drv->aacr_algo = BATT_AACR_ALGO_DEFAULT;
 
 	/* NOTE: with NG charger tolerance is applied from "charger" */
 	gbms_init_chg_table(profile, node, aacr_get_capacity(batt_drv));
@@ -4521,19 +4541,38 @@ static ssize_t aacr_state_store(struct device *dev,
 {
 	struct power_supply *psy = container_of(dev, struct power_supply, dev);
 	struct batt_drv *batt_drv = power_supply_get_drvdata(psy);
-	int state, ret = 0;
+	int val, state, algo, ret = 0;
 
-	ret = kstrtoint(buf, 0, &state);
+	ret = kstrtoint(buf, 0, &val);
 	if (ret < 0)
 		return ret;
 
-	if ((state != BATT_AACR_DISABLED) && (state != BATT_AACR_ENABLED))
+	if (val < BATT_AACR_DISABLED) /* not allow minus value */
 		return -ERANGE;
 
-	if (batt_drv->aacr_state == state)
+	switch (val) {
+	case BATT_AACR_DISABLED:
+		state = BATT_AACR_DISABLED;
+		break;
+	case BATT_AACR_ENABLED:
+		state = BATT_AACR_ENABLED;
+		algo = BATT_AACR_ALGO_DEFAULT;
+		break;
+	case BATT_AACR_ALGO_LOW_B:
+		state = BATT_AACR_ENABLED;
+		algo = BATT_AACR_ALGO_LOW_B;
+		break;
+	default:
+		return -ERANGE;
+	}
+
+	if (batt_drv->aacr_state == state && batt_drv->aacr_algo == algo)
 		return count;
 
+	pr_info("aacr_state: %d -> %d, aacr_algo: %d -> %d\n",
+		batt_drv->aacr_state, state, batt_drv->aacr_algo, algo);
 	batt_drv->aacr_state = state;
+	batt_drv->aacr_algo = algo;
 	return count;
 }
 
@@ -4593,6 +4632,17 @@ static ssize_t aacr_cycle_max_store(struct device *dev,
 
 static DEVICE_ATTR_RW(aacr_cycle_max);
 
+static ssize_t aacr_algo_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct power_supply *psy = container_of(dev, struct power_supply, dev);
+	struct batt_drv *batt_drv = power_supply_get_drvdata(psy);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", batt_drv->aacr_algo);
+}
+
+static DEVICE_ATTR_RO(aacr_algo);
+
 static struct attribute *batt_attrs[] = {
 	&dev_attr_charge_stats.attr,
 	&dev_attr_charge_stats_actual.attr,
@@ -4616,6 +4666,7 @@ static struct attribute *batt_attrs[] = {
 	&dev_attr_aacr_state.attr,
 	&dev_attr_aacr_cycle_grace.attr,
 	&dev_attr_aacr_cycle_max.attr,
+	&dev_attr_aacr_algo.attr,
 	NULL,
 };
 
